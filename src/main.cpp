@@ -1,37 +1,159 @@
-
+#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <MQTT.h>
+#include "secrets.h"  // WiFi credentials and AWS certificates
 
-// Pin definitions
+// ============== AWS IOT CONFIG ==============
+const char* AWS_IOT_ENDPOINT = "a2iwaullg29s71-ats.iot.us-west-1.amazonaws.com";
+const char* CLIENT_ID = "GreenGuardian";
+const char* TOPIC_PUBLISH = "greenguardian/sensors";
+
+// ============== PIN DEFINITIONS ==============
 const int sensorPin = 34;      // Soil moisture sensor
 const int relayPin = 25;       // Water pump relay
-// ATH21B uses I2C: SDA = GPIO21, SCL = GPIO22 (default for ESP32)
 
+// ============== SENSOR OBJECT ==============
 Adafruit_AHTX0 aht;
 
-// Watering settings
-const int dryThreshold = 40;   // Water if below 40% hydrated
-const int checkInterval = 15000;  // Wait 15 seconds between checks
-const int pumpDuration = 1000;    // Pump for 1 second
+// ============== WATERING SETTINGS ==============
+const int dryThreshold = 40;
+const int checkInterval = 15000;
+const int pumpDuration = 1000;
 
-// Calibration values - adjust these based on your sensor
-int dryValue = 4095;   // Raw value when completely dry
-int wetValue = 0;      // Raw value when in water
+// ============== CALIBRATION VALUES ==============
+int dryValue = 4095;
+int wetValue = 0;
 
+// ============== TIMING VARIABLES ==============
 unsigned long lastCheckTime = 0;
+unsigned long lastPublishTime = 0;
+const unsigned long publishInterval = 30000;  // Publish to AWS every 30 seconds
 
+// ============== AWS OBJECTS ==============
+WiFiClientSecure net;
+MQTTClient client(512);
+
+// ============== SENSOR DATA ==============
+int hydration = 0;
+float tempC = 0;
+float tempF = 0;
+float humidity = 0;
+String moistureStatus = "";
+
+// ============== CONNECT TO WIFI ==============
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ============== CONNECT TO AWS IOT ==============
+void connectAWS() {
+  net.setCACert(AWS_ROOT_CA);
+  net.setCertificate(AWS_DEVICE_CERT);
+  net.setPrivateKey(AWS_PRIVATE_KEY);
+
+  client.begin(AWS_IOT_ENDPOINT, 8883, net);
+
+  Serial.print("Connecting to AWS IoT");
+  
+  while (!client.connect(CLIENT_ID)) {
+    Serial.print(".");
+    delay(1000);
+  }
+
+  Serial.println();
+  Serial.println("AWS IoT connected!");
+}
+
+// ============== PUBLISH SENSOR DATA TO AWS ==============
+void publishSensorData() {
+  String payload = "{";
+  payload += "\"soilHydration\":" + String(hydration) + ",";
+  payload += "\"moistureStatus\":\"" + moistureStatus + "\",";
+  payload += "\"temperatureF\":" + String(tempF, 1) + ",";
+  payload += "\"temperatureC\":" + String(tempC, 1) + ",";
+  payload += "\"humidity\":" + String(humidity, 1);
+  payload += "}";
+
+  if (client.publish(TOPIC_PUBLISH, payload)) {
+    Serial.println(">>> Published to AWS IoT <<<");
+    Serial.println(payload);
+  } else {
+    Serial.println("AWS publish failed!");
+  }
+}
+
+// ============== READ ALL SENSORS ==============
+void readSensors() {
+  int rawSoil = analogRead(sensorPin);
+  hydration = map(rawSoil, dryValue, wetValue, 0, 100);
+  hydration = constrain(hydration, 0, 100);
+  
+  sensors_event_t humidity_event, temp_event;
+  aht.getEvent(&humidity_event, &temp_event);
+  
+  tempC = temp_event.temperature;
+  tempF = (tempC * 9.0 / 5.0) + 32.0;
+  humidity = humidity_event.relative_humidity;
+  
+  if (hydration < 15) {
+    moistureStatus = "VERY DRY";
+  } else if (hydration < 30) {
+    moistureStatus = "DRY";
+  } else if (hydration < 40) {
+    moistureStatus = "SLIGHTLY DRY";
+  } else {
+    moistureStatus = "MOIST";
+  }
+}
+
+// ============== DISPLAY READINGS ==============
+void displayReadings() {
+  Serial.println("--- Current Readings ---");
+  Serial.print("Soil Hydration: ");
+  Serial.print(hydration);
+  Serial.print("% [");
+  Serial.print(moistureStatus);
+  Serial.println("]");
+  
+  Serial.print("Temperature: ");
+  Serial.print(tempF, 1);
+  Serial.print("F (");
+  Serial.print(tempC, 1);
+  Serial.println("C)");
+  
+  Serial.print("Humidity: ");
+  Serial.print(humidity, 1);
+  Serial.println("%");
+}
+
+// ============== SETUP ==============
 void setup() {
   Serial.begin(9600);
+  delay(2000);
+  
   pinMode(relayPin, OUTPUT);
   digitalWrite(relayPin, HIGH);  // Pump OFF (inverted relay)
   
-  Wire.begin(21, 22);  // SDA = 21, SCL = 22
+  Wire.begin(21, 22);
   
   Serial.println("=================================");
   Serial.println("Auto Plant Watering System v1.0");
   Serial.println("=================================");
   
-  // Initialize ATH21B sensor
   if (!aht.begin()) {
     Serial.println("ERROR: Could not find ATH21B sensor!");
     Serial.println("Check wiring:");
@@ -44,50 +166,27 @@ void setup() {
   
   Serial.println("ATH21B sensor initialized!");
   Serial.println();
-  delay(2000);
+  
+  connectWiFi();
+  connectAWS();
+  
+  Serial.println();
+  Serial.println("System ready! Monitoring plant...");
+  Serial.println();
 }
 
+// ============== LOOP ==============
 void loop() {
-  // Read soil moisture
-  int rawSoil = analogRead(sensorPin);
-  int hydration = map(rawSoil, dryValue, wetValue, 0, 100);
-  hydration = constrain(hydration, 0, 100);
+  client.loop();
   
-  // Read temperature and humidity from ATH21B
-  sensors_event_t humidity_event, temp_event;
-  aht.getEvent(&humidity_event, &temp_event);
-  
-  float tempC = temp_event.temperature;
-  float tempF = (tempC * 9.0 / 5.0) + 32.0;
-  float humidity = humidity_event.relative_humidity;
-  
-  // Display all readings
-  Serial.println("--- Current Readings ---");
-  Serial.print("Soil Hydration: ");
-  Serial.print(hydration);
-  Serial.print("%");
-  
-  if (hydration < 15) {
-    Serial.println(" [VERY DRY]");
-  } else if (hydration < 30) {
-    Serial.println(" [DRY]");
-  } else if (hydration < 40) {
-    Serial.println(" [SLIGHTLY DRY]");
-  } else {
-    Serial.println(" [MOIST]");
+  if (!client.connected()) {
+    Serial.println("AWS IoT disconnected. Reconnecting...");
+    connectAWS();
   }
   
-  Serial.print("Temperature: ");
-  Serial.print(tempF, 1);
-  Serial.print("°F (");
-  Serial.print(tempC, 1);
-  Serial.println("°C)");
+  readSensors();
+  displayReadings();
   
-  Serial.print("Humidity: ");
-  Serial.print(humidity, 1);
-  Serial.println("%");
-  
-  // Check if it's time to evaluate watering
   unsigned long currentTime = millis();
   
   if (currentTime - lastCheckTime >= checkInterval) {
@@ -98,9 +197,9 @@ void loop() {
       Serial.println(">>> WATERING ACTIVATED <<<");
       Serial.println("Pumping water for 1 second...");
       
-      digitalWrite(relayPin, LOW);  // Pump ON (inverted relay)
+      digitalWrite(relayPin, LOW);
       delay(pumpDuration);
-      digitalWrite(relayPin, HIGH);   // Pump OFF (inverted relay)
+      digitalWrite(relayPin, HIGH);
       
       Serial.println("Watering complete. Waiting 15 seconds...");
     } else {
@@ -108,6 +207,11 @@ void loop() {
     }
   }
   
+  if (currentTime - lastPublishTime >= publishInterval) {
+    lastPublishTime = currentTime;
+    publishSensorData();
+  }
+  
   Serial.println();
-  delay(2000);  // Update display every 2 seconds
+  delay(2000);
 }
